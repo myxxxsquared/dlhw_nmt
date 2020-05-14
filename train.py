@@ -10,6 +10,11 @@ import nltk
 from nltk.tokenize import word_tokenize
 from rouge import Rouge 
 
+import pickle
+import gzip
+
+import csv
+
 def genpaddingmask(data):
     return tf.cast(data == 0, tf.float32)[:, tf.newaxis, tf.newaxis, :]
 
@@ -148,6 +153,8 @@ def main():
         train_accuracy(en_output, pred)
 
     maxtrainacc = 0
+    finfo = open('data/train-info.csv', 'wt', newline='')
+    infowriter = csv.writer(finfo)
 
     for epoch in range(1000):
         train_loss.reset_states()
@@ -159,6 +166,10 @@ def main():
                 f"{epoch:03d}: {train_loss.result():.4f}, {train_accuracy.result():.4f}"
             )
 
+        trainloss = float(train_loss.result())
+        trainacc = float(train_accuracy.result())
+
+        train_accuracy.reset_states()
         t = tqdm.tqdm(enumerate(data.data_validation))
         for batch, (en, cn) in t:
             valid_step(en, cn)
@@ -174,12 +185,129 @@ def main():
             maxtrainacc = curtrainacc
             print("Copy Best")
 
+        infowriter.writerow((epoch, trainloss, trainacc, curtrainacc))
+        finfo.flush()
+
         # print(
         #     "Epoch {} Loss {:.4f} Accuracy {:.4f}".format(
         #         epoch + 1, train_loss.result(), train_accuracy.result()
         #     )
         # )
 
+
+def train_rev():
+    data = preprocessdata()
+    params = HyperParameters(data)
+    learning_rate = CustomSchedule(params.d_model)
+
+    model = Transformer(
+        params.num_layers,
+        params.d_model,
+        params.num_heads,
+        params.dff,
+        params.en_vocab_size,
+        params.cn_vocab_size,
+        params.en_vocab_size,
+        params.cn_vocab_size,
+        params.dropout_rate,
+    )
+
+    loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+        from_logits=True, reduction="none"
+    )
+
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9
+    )
+
+    train_loss = tf.keras.metrics.Mean(name="train_loss")
+    train_accuracy = CatetoricalAccuracy(name="accuracy")
+
+    ckpt = tf.train.Checkpoint(model=model, optimizer=optimizer)
+
+    ckpt_manager = tf.train.CheckpointManager(ckpt, "train-rev/model", max_to_keep=5)
+
+
+    finfo = open('data/train-rev-info.csv', 'wt', newline='')
+    infowriter = csv.writer(finfo)
+
+    if ckpt_manager.latest_checkpoint:
+        ckpt.restore(ckpt_manager.latest_checkpoint)
+        print("Latest checkpoint restored!!")
+
+    @tf.function
+    def train_step(en, cn):
+        en, cn = cn, en
+        en_input = en[:, :-1]
+        en_output = en[:, 1:]
+
+        input_mask = genpaddingmask(cn)
+        decode_mask = tf.maximum(
+            genpaddingmask(en_input), genlookmask(tf.shape(en_input)[1])
+        )
+
+        with tf.GradientTape() as tape:
+            pred, _ = model(cn, en_input, True, input_mask, decode_mask, input_mask)
+            loss = loss_object(en_output, pred)
+            loss = loss * tf.cast(en_output != 0, tf.float32)
+            loss = tf.reduce_mean(loss)
+        grad = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(grad, model.trainable_variables))
+
+        train_loss(loss)
+        train_accuracy(en_output, pred)
+
+    @tf.function
+    def valid_step(en, cn):
+        en, cn = cn, en
+        en_input = en[:, :-1]
+        en_output = en[:, 1:]
+        input_mask = genpaddingmask(cn)
+        decode_mask = tf.maximum(
+            genpaddingmask(en_input), genlookmask(tf.shape(en_input)[1])
+        )
+        pred, _ = model(cn, en_input, False, input_mask, decode_mask, input_mask)
+        train_accuracy(en_output, pred)
+
+    maxtrainacc = 0
+
+    for epoch in range(1000):
+        train_loss.reset_states()
+        train_accuracy.reset_states()
+        t = tqdm.tqdm(enumerate(data.data_train))
+        for batch, (en, cn) in t:
+            train_step(en, cn)
+            t.desc = (
+                f"{epoch:03d}: {train_loss.result():.4f}, {train_accuracy.result():.4f}"
+            )
+        
+        trainloss = float(train_loss.result())
+        trainacc = float(train_accuracy.result())
+
+        train_accuracy.reset_states()
+        t = tqdm.tqdm(enumerate(data.data_validation))
+        for batch, (en, cn) in t:
+            valid_step(en, cn)
+            t.desc = f"{epoch:03d}: {train_accuracy.result():.4f}"
+        print(f"Epoch {epoch:03d}: {train_accuracy.result():.4f}")
+
+        infowriter.writerow((epoch, trainloss, trainacc, curtrainacc))
+        finfo.flush()
+
+        ckpt_save_path = ckpt_manager.save()
+
+        curtrainacc = float(train_accuracy.result())
+        if curtrainacc > maxtrainacc:
+            os.system("rm -rf train-rev-best")
+            os.system("cp -r train-rev train-rev-best")
+            maxtrainacc = curtrainacc
+            print("Copy Best")
+
+        # print(
+        #     "Epoch {} Loss {:.4f} Accuracy {:.4f}".format(
+        #         epoch + 1, train_loss.result(), train_accuracy.result()
+        #     )
+        # )
 
 def evaluation():
     rouge = Rouge()
@@ -309,18 +437,142 @@ def evaluation():
             totalb += b
             countb += 1
             
-            # print(data.cntok.decode(l))
-            # print(x)
-            # print(y)
-            # print(b)
-            # print()
-        # break
+            print(data.cntok.decode(l))
+            print(x)
+            print(y)
+            print(b)
+            print()
+        break
 
     print(count / total)
     print(totalb / countb)
     print(totalr / countb)
     print(totalm / countb)
 
+
+def evaluation_rev():
+    new_corpus_cn = []
+    new_corpus_en = []
+
+    data = preprocessdata()
+    params = HyperParameters(data)
+
+    model = Transformer(
+        params.num_layers,
+        params.d_model,
+        params.num_heads,
+        params.dff,
+        params.en_vocab_size,
+        params.cn_vocab_size,
+        params.en_vocab_size,
+        params.cn_vocab_size,
+        params.dropout_rate,
+    )
+
+    ckpt = tf.train.Checkpoint(model=model)
+    ckpt_manager = tf.train.CheckpointManager(ckpt, "train-rev-best/model", max_to_keep=5)
+    ckpt.restore(ckpt_manager.latest_checkpoint).expect_partial()
+
+    NUM_BEAM = 4
+    SEQLEN = 20
+
+    def eval_step(en, cn, idx):
+        en_input = en
+        input_mask = genpaddingmask(cn)
+        decode_mask = genlookmask(tf.shape(en_input)[1])
+
+        pred, _ = model(cn, en_input, False, input_mask, decode_mask, input_mask)
+        pred = pred[:, idx]
+        pred = tf.nn.softmax(pred, -1)
+
+        pred = tf.reshape(pred, (-1, NUM_BEAM, params.cn_vocab_size))
+        values, indices = tf.math.top_k(pred, NUM_BEAM)
+        return values, indices
+
+    for batch, (en, cn) in tqdm.tqdm(enumerate(data.data_train)):
+        batch_size = int(tf.shape(cn)[0])
+
+        en, cn = cn, en
+
+        cn_origin = cn
+
+        cn = cn[:, tf.newaxis]
+        cn = tf.tile(cn, (1, NUM_BEAM, 1))
+        cn = tf.reshape(cn, (-1, SEQLEN))
+
+        finished = np.zeros(shape=(batch_size, NUM_BEAM), dtype=np.bool)
+        prob = np.ones(shape=(batch_size, NUM_BEAM), dtype=np.float)
+        en_pred = np.zeros(shape=(batch_size, NUM_BEAM, SEQLEN), dtype=np.int)
+        en_pred[:, :, 0] = data.cntok_begin
+
+        for outlab in range(SEQLEN - 1):
+            values, indices = eval_step(
+                tf.reshape(tf.convert_to_tensor(en_pred[:, :, :-1]), (-1, SEQLEN-1)), cn, outlab
+            )
+
+            new_finished = np.logical_or(indices.numpy() == data.cntok_end, np.expand_dims(finished, 1))
+            values = values.numpy()
+            values[new_finished] = 1
+            new_prob = np.expand_dims(prob, -1) * values
+            new_pred = np.tile(np.expand_dims(en_pred, -2), (1, 1, NUM_BEAM, 1))
+            new_pred[:, :, :, outlab + 1] = indices
+
+            new_prob = np.reshape(new_prob, (-1, NUM_BEAM * NUM_BEAM))
+            new_pred = np.reshape(new_pred, (-1, NUM_BEAM * NUM_BEAM, SEQLEN))
+
+            sort_prob = np.argsort(new_prob)[:, ::-1]
+            prob = np.empty(shape=prob.shape, dtype=prob.dtype)
+            en_pred = np.empty(shape=en_pred.shape, dtype=en_pred.dtype)
+            for i in range(batch_size):
+                for j in range(NUM_BEAM):
+                    en_pred[i, j] = new_pred[i, sort_prob[i, j]]
+                    prob[i, j] = new_prob[i, sort_prob[i, j]]
+
+            finished = np.logical_or(
+                finished, en_pred[:, :, outlab + 1] == data.cntok_end
+            )
+
+        en_pred = en_pred[:, 0]
+
+        for i, x in enumerate(en_pred):
+            for j in range(SEQLEN - 1):
+                if x[j] == data.cntok_end:
+                    x[j + 1 :] = 0
+                    break
+
+        # en_ground = en[:, 1:]
+        # en_output = en_pred[:, 1:]
+
+        # for idx in range(batch_size):
+        #     x = np.array(en_ground[idx].numpy())
+        #     y = np.array(en_output[idx])
+        #     l = np.array(cn_origin[idx, 1:].numpy())
+        #     for j in range(SEQLEN - 1):
+        #         if l[j] == data.entok_end:
+        #             l[j:] = 0
+        #     for j in range(SEQLEN - 1):
+        #         if x[j] == data.cntok_end:
+        #             x[j:] = 0
+        #     for j in range(SEQLEN - 1):
+        #         if y[j] == data.cntok_end:
+        #             y[j:] = 0
+        #     x = data.cntok.decode(x)
+        #     xs = word_tokenize(x)
+        #     y = data.cntok.decode(y)
+        #     ys = word_tokenize(y)
+            
+        #     print(data.entok.decode(l))
+        #     print(x)
+        #     print(y)
+
+        new_corpus_cn.append(en_pred)
+        new_corpus_en.append(cn_origin.numpy())
+        # break
+
+    new_corpus_cn = np.concatenate(new_corpus_cn, 0)
+    new_corpus_en = np.concatenate(new_corpus_en, 0)
+
+    pickle.dump((new_corpus_cn, new_corpus_en), gzip.open("data/new_corpus.pkl.gz", "wb"))
 
 if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "7"
@@ -337,3 +589,6 @@ if __name__ == "__main__":
 
     # main()
     evaluation()
+
+    # train_rev()
+    # evaluation_rev()
